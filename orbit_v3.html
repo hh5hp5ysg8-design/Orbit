@@ -1,0 +1,327 @@
+<!doctype html>
+<html lang="de">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+<title>Orbit v3</title>
+<style>
+  :root{ --rahmen:#070b1c; --text:#eaf2ff; --akzent:#5cf0d8; --tod:#ff5c78; }
+  *{ box-sizing:border-box; }
+  html,body{ margin:0; height:100%; background:var(--rahmen);
+    font-family:ui-rounded,"Segoe UI",system-ui,sans-serif; color:var(--text);
+    -webkit-user-select:none; user-select:none; overscroll-behavior:none; }
+  .wrap{ max-width:460px; margin:0 auto; padding:10px; }
+  h1{ font-size:17px; margin:6px 4px 8px; font-weight:800; letter-spacing:.3px; }
+  h1 span{ color:var(--akzent); }
+  .stage{ position:relative; width:100%; aspect-ratio:420/680;
+    border-radius:18px; overflow:hidden; touch-action:none; cursor:pointer;
+    box-shadow:0 14px 44px rgba(0,0,0,.5); border:2px solid rgba(255,255,255,.06); }
+  canvas{ display:block; width:100%; height:100%; }
+  .overlay{ position:absolute; inset:0; display:flex; flex-direction:column;
+    align-items:center; justify-content:center; gap:14px; text-align:center;
+    background:rgba(7,11,28,.80); backdrop-filter:blur(3px); padding:24px; }
+  .overlay h2{ margin:0; font-size:26px; }
+  .overlay p{ margin:0; opacity:.85; font-size:14px; max-width:340px; line-height:1.55; }
+  .overlay button{ margin-top:6px; padding:12px 26px; border:none; border-radius:999px;
+    background:var(--akzent); color:#06231f; font-weight:800; font-size:15px; cursor:pointer; }
+  .hidden{ display:none; }
+  .hint{ font-size:12px; opacity:.6; margin:10px 4px 0; line-height:1.5; }
+  .hint b.a{ color:var(--akzent); }
+</style>
+</head>
+<body>
+  <div class="wrap">
+    <h1>Orbit <span>· v3 · Mischung</span></h1>
+    <div class="stage" id="stage">
+      <canvas id="game" width="420" height="680"></canvas>
+      <div class="overlay" id="overlay">
+        <h2>Orbit · v3</h2>
+        <p><b>Lies die Räume über dir</b> und fädle mit Schwung durch die Lücken.
+           Drücken = greifen &amp; kreisen, Loslassen = abschießen, schnell Tippen = enger ziehen.
+           <b>Rote Wände töten</b> — ziel durch die Lücke.</p>
+        <button id="startBtn">Start</button>
+      </div>
+    </div>
+    <p class="hint"><b class="a">Räume lesen &amp; durchschießen.</b> Außen = viel Schub/Reichweite, eng gezogen = präzise &amp; sanft. Rot = Tod, durch die Lücke zielen.</p>
+  </div>
+
+<script>
+"use strict";
+try{ document.querySelector('h1').innerHTML += ' · <span style="color:#5cf0d8">JS aktiv \u2713</span>'; }catch(e){}
+
+const canvas = document.getElementById('game');
+const ctx = canvas.getContext('2d');
+const W = canvas.width, H = canvas.height;
+const overlay = document.getElementById('overlay');
+
+// ---- Tuning -------------------------------------------------------------
+const BALL_R    = 9;
+const MIN_SPEED = 2.6;
+const MAX_SPEED = 10;      // ein Ticken schneller
+const W_CAP     = 0.24;
+const OUTER_BON = 0.042;
+const MAX_LAUNCH= 13;
+const REEL      = 0.78;
+const MIN_R     = 15;
+const TAP_MS    = 150;
+const FRIC      = 0.993;   // etwas mehr Bremse
+const GRAV      = 0.10;    // stärker -> knackiger, weniger Schweben
+const REST      = 0.9;
+const CAM_OFF   = H*0.72;   // Ball sitzt tiefer -> mehr Vorausschau
+const CAM_LERP  = 0.12;
+const BAND_H    = 150;
+const ROOM_EVERY= 3;       // alle N Bänder eine Wand mit Lücke
+const GAP_W     = 106;     // Breite der Lücke
+const WALL_H    = 14;
+
+// ---- Zustand ------------------------------------------------------------
+let state, ball, cam, deathY, deathSpeed, score, best, genTop, bandCount;
+let rings, bands, barriers, trail, pressT;
+
+best = loadBest();
+setup();
+
+function loadBest(){ try{ return parseInt(localStorage.getItem('orbitBestV3')||'0',10)||0; }catch(e){ return 0; } }
+function saveBest(){ try{ localStorage.setItem('orbitBestV3', String(best)); }catch(e){} }
+
+function setup(){
+  state='ready';
+  ball={ x:W/2, y:0, vx:0, vy:-5, mode:'free', ring:null, ang:0, dir:1, rad:0, speed:MIN_SPEED };
+  cam = ball.y - CAM_OFF;
+  deathY = H*0.7; deathSpeed = 0.28;
+  score = 0; genTop = 0; bandCount = 0;
+  rings=[]; bands=[]; barriers=[]; trail=[]; pressT=0;
+  rings.push({ x:W/2, y:-130, rv:24 });
+  genTop = -130;
+  for(let i=0;i<8;i++) generateBand();
+}
+
+function start(){ setup(); state='play'; overlay.classList.add('hidden'); }
+
+// ---- Welt ---------------------------------------------------------------
+function rand(a,b){ return a+Math.random()*(b-a); }
+
+function generateBand(){
+  genTop -= BAND_H;
+  bandCount++;
+
+  if(bandCount % ROOM_EVERY === 0){
+    // tödliche Wand mit Lücke + Absprungring darunter + Fangring darüber
+    const gapX = rand(W*0.30, W*0.70);
+    const wy = genTop;
+    if(gapX - GAP_W/2 > 4)   barriers.push({ x:0, y:wy, w:gapX-GAP_W/2, h:WALL_H });
+    if(gapX + GAP_W/2 < W-4) barriers.push({ x:gapX+GAP_W/2, y:wy, w:W-(gapX+GAP_W/2), h:WALL_H });
+    rings.push({ x:gapX, y: wy + 78, rv:24 });
+    rings.push({ x:gapX, y: wy - 82, rv:24 });
+  } else {
+    rings.push({ x: rand(W*0.2, W*0.8), y: genTop, rv: rand(20,28) });
+    if(Math.random()<0.35)
+      rings.push({ x: rand(W*0.2, W*0.8), y: genTop - BAND_H*0.5, rv: rand(20,28) });
+  }
+
+  if(Math.random()<0.25){
+    if(Math.random()<0.5) bands.push({ x: rand(20,60), y: genTop-30, w:12, h: rand(70,110) });
+    else                  bands.push({ x: rand(W-72,W-32), y: genTop-30, w:12, h: rand(70,110) });
+  }
+}
+
+function ensureWorld(){
+  while(genTop > cam - 220) generateBand();
+  const cut = deathY + 100;
+  rings    = rings.filter(o=>o.y < cut);
+  bands    = bands.filter(o=>o.y < cut);
+  barriers = barriers.filter(o=>o.y < cut);
+}
+
+// ---- Eingabe ------------------------------------------------------------
+function onDown(now){
+  if(state==='ready'||state==='over'){ start(); return; }
+  if(state!=='play') return;
+  pressT = now;
+  if(ball.mode==='free') latchNearest();
+}
+function onUp(now){
+  if(state!=='play' || ball.mode!=='orbit') return;
+  const dt = now - pressT;
+  if(dt >= TAP_MS) launch(); else reel();
+}
+
+function latchNearest(){
+  let pick=null, bd=1e9;
+  for(const r of rings){
+    const sYy = r.y - cam;
+    if(sYy < 0 || sYy > H) continue;
+    const d = Math.hypot(ball.x-r.x, ball.y-r.y);
+    if(d < bd){ bd=d; pick=r; }
+  }
+  if(!pick) return;
+  ball.mode='orbit'; ball.ring=pick;
+  ball.rad = Math.max(MIN_R, bd);
+  ball.speed = Math.max(MIN_SPEED, Math.min(MAX_SPEED, Math.hypot(ball.vx, ball.vy)));
+  ball.ang = Math.atan2(ball.y-pick.y, ball.x-pick.x);
+  const cross = (ball.x-pick.x)*ball.vy - (ball.y-pick.y)*ball.vx;
+  ball.dir = cross<0 ? -1 : 1;
+}
+function reel(){ ball.rad = Math.max(MIN_R, ball.rad*REEL); }
+function launch(){
+  const sp = Math.min(MAX_LAUNCH, ball.speed + OUTER_BON*ball.rad);
+  ball.vx = -Math.sin(ball.ang) * ball.dir * sp;
+  ball.vy =  Math.cos(ball.ang) * ball.dir * sp;
+  ball.mode='free'; ball.ring=null;
+}
+
+const stage = document.getElementById('stage');
+stage.addEventListener('mousedown', e=>{ e.preventDefault(); onDown(performance.now()); });
+window.addEventListener('mouseup',  ()=> onUp(performance.now()));
+stage.addEventListener('touchstart',e=>{ e.preventDefault(); onDown(performance.now()); }, {passive:false});
+window.addEventListener('touchend', e=>{ e.preventDefault(); onUp(performance.now()); }, {passive:false});
+document.getElementById('startBtn').onclick = start;
+
+// ---- Physik -------------------------------------------------------------
+function closest(px,py,rx,ry,rw,rh){
+  return { x:Math.max(rx,Math.min(px,rx+rw)), y:Math.max(ry,Math.min(py,ry+rh)) };
+}
+
+function update(){
+  if(state!=='play') return;
+
+  if(ball.mode==='orbit'){
+    let w = ball.speed / ball.rad; if(w > W_CAP) w = W_CAP;
+    ball.ang += w * ball.dir;
+    ball.x = ball.ring.x + Math.cos(ball.ang)*ball.rad;
+    ball.y = ball.ring.y + Math.sin(ball.ang)*ball.rad;
+  } else {
+    ball.x += ball.vx; ball.y += ball.vy;
+    ball.vx *= FRIC;   ball.vy *= FRIC;  ball.vy += GRAV;
+
+    if(ball.x < BALL_R){ ball.x=BALL_R; ball.vx=Math.abs(ball.vx)*REST; }
+    if(ball.x > W-BALL_R){ ball.x=W-BALL_R; ball.vx=-Math.abs(ball.vx)*REST; }
+
+    for(const b of bands){
+      const c=closest(ball.x,ball.y,b.x,b.y,b.w,b.h);
+      const dx=ball.x-c.x, dy=ball.y-c.y, d=Math.hypot(dx,dy);
+      if(d<BALL_R){
+        const nx=d>0.001?dx/d:0, ny=d>0.001?dy/d:-1, push=BALL_R-d;
+        ball.x+=nx*push; ball.y+=ny*push;
+        const dot=ball.vx*nx+ball.vy*ny;
+        ball.vx=(ball.vx-2*dot*nx)*REST; ball.vy=(ball.vy-2*dot*ny)*REST;
+      }
+    }
+    for(const o of barriers){
+      const c=closest(ball.x,ball.y,o.x,o.y,o.w,o.h);
+      if(Math.hypot(ball.x-c.x, ball.y-c.y) < BALL_R){ gameOver(); return; }
+    }
+  }
+
+  cam += ((ball.y - CAM_OFF) - cam) * CAM_LERP;
+
+  deathSpeed = 0.28 + score*0.0010;
+  deathY -= deathSpeed;
+  if(ball.y >= deathY){ gameOver(); return; }
+
+  score = Math.max(score, Math.floor((-ball.y)/8));
+  trail.push({x:ball.x,y:ball.y}); if(trail.length>16) trail.shift();
+  ensureWorld();
+}
+
+function gameOver(){
+  if(state!=='play') return;
+  state='over';
+  if(score>best){ best=score; saveBest(); }
+  overlay.innerHTML='<h2>Vorbei!</h2><p>Höhe: <b>'+score+' m</b> · Best: <b>'+best
+    +' m</b><br>Räume von unten lesen, eng ziehen für die Lücke, außen greifen für Reichweite.</p>'
+    +'<button id="startBtn">Nochmal</button>';
+  overlay.classList.remove('hidden');
+  document.getElementById('startBtn').onclick=start;
+}
+
+// ---- Zeichnen -----------------------------------------------------------
+function sy(y){ return y - cam; }
+
+function render(){
+  ctx.clearRect(0,0,W,H);
+  const g=ctx.createLinearGradient(0,0,0,H);
+  g.addColorStop(0,'#0a1230'); g.addColorStop(1,'#05081a');
+  ctx.fillStyle=g; ctx.fillRect(0,0,W,H);
+
+  ctx.fillStyle='rgba(255,255,255,.05)';
+  const step=46, off=((cam%step)+step)%step;
+  for(let y=-off;y<H;y+=step) for(let x=10;x<W;x+=step) ctx.fillRect(x,y,2,2);
+
+  for(const b of bands){ ctx.fillStyle='rgba(191,233,255,.85)';
+    rr(b.x,sy(b.y),b.w,b.h,4); ctx.fill(); }
+
+  for(const o of barriers){
+    rr(o.x,sy(o.y),o.w,o.h,3);
+    ctx.fillStyle='rgba(255,92,120,.92)'; ctx.fill();
+    ctx.strokeStyle='rgba(255,170,190,.6)'; ctx.lineWidth=1.5; ctx.stroke();
+  }
+
+  for(const r of rings){
+    const y=sy(r.y); if(y<-60||y>H+60) continue;
+    ctx.beginPath(); ctx.arc(r.x,y,r.rv,0,Math.PI*2);
+    ctx.strokeStyle='rgba(92,240,216,.85)'; ctx.lineWidth=3; ctx.stroke();
+    ctx.beginPath(); ctx.arc(r.x,y,3.5,0,Math.PI*2);
+    ctx.fillStyle='#5cf0d8'; ctx.fill();
+  }
+
+  if(ball.mode==='orbit' && ball.ring){
+    const r=ball.ring;
+    ctx.beginPath(); ctx.arc(r.x,sy(r.y),ball.rad,0,Math.PI*2);
+    ctx.strokeStyle='rgba(255,255,255,.22)'; ctx.lineWidth=1.5; ctx.stroke();
+    ctx.beginPath(); ctx.moveTo(r.x,sy(r.y)); ctx.lineTo(ball.x,sy(ball.y));
+    ctx.strokeStyle='rgba(255,255,255,.4)'; ctx.stroke();
+  }
+
+  for(let i=0;i<trail.length;i++){ const t=trail[i], a=i/trail.length;
+    ctx.beginPath(); ctx.arc(t.x,sy(t.y),BALL_R*a*0.8,0,Math.PI*2);
+    ctx.fillStyle='rgba(92,240,216,'+(a*0.25)+')'; ctx.fill(); }
+
+  ctx.beginPath(); ctx.arc(ball.x,sy(ball.y),BALL_R,0,Math.PI*2);
+  ctx.fillStyle='#eaf2ff'; ctx.fill();
+  ctx.strokeStyle='#5cf0d8'; ctx.lineWidth=2; ctx.stroke();
+
+  const dyS=sy(deathY);
+  if(dyS<H){
+    const dg=ctx.createLinearGradient(0,dyS,0,H);
+    dg.addColorStop(0,'rgba(255,92,120,0)'); dg.addColorStop(1,'rgba(255,92,120,.45)');
+    ctx.fillStyle=dg; ctx.fillRect(0,dyS,W,H-dyS);
+    ctx.strokeStyle='rgba(255,92,120,.9)'; ctx.lineWidth=2;
+    ctx.beginPath(); ctx.moveTo(0,dyS); ctx.lineTo(W,dyS); ctx.stroke();
+  }
+
+  ctx.fillStyle='rgba(234,242,255,.9)'; ctx.font='800 18px system-ui';
+  ctx.fillText(score+' m',14,28);
+  ctx.fillStyle='rgba(234,242,255,.5)'; ctx.font='600 12px system-ui';
+  ctx.fillText('Best '+best,14,46);
+
+  if(ball.mode==='orbit'){
+    const launchSp=Math.min(MAX_LAUNCH, ball.speed + OUTER_BON*ball.rad);
+    const power=launchSp/MAX_LAUNCH;
+    ctx.fillStyle='rgba(255,255,255,.12)'; rr(W-128,18,108,12,6); ctx.fill();
+    ctx.fillStyle=power>0.66?'#ffaa5a':'#5cf0d8'; rr(W-128,18,108*power,12,6); ctx.fill();
+    ctx.fillStyle='rgba(234,242,255,.7)'; ctx.font='600 11px system-ui';
+    ctx.fillText('Schub',W-126,46);
+  }
+}
+
+function rr(x,y,w,h,r){
+  ctx.beginPath(); ctx.moveTo(x+r,y);
+  ctx.arcTo(x+w,y,x+w,y+h,r); ctx.arcTo(x+w,y+h,x,y+h,r);
+  ctx.arcTo(x,y+h,x,y,r);     ctx.arcTo(x,y,x+w,y,r); ctx.closePath();
+}
+
+// ---- Schleife -----------------------------------------------------------
+let lastT=performance.now(), acc=0; const STEP=1000/60;
+function loop(now){
+  requestAnimationFrame(loop);
+  try{
+    acc += Math.min(now-lastT,100); lastT=now;
+    while(acc>=STEP){ update(); acc-=STEP; }
+    render();
+  }catch(err){ console.error('Frame-Fehler:',err); }
+}
+requestAnimationFrame(loop);
+</script>
+</body>
+</html>
